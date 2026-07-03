@@ -1,0 +1,626 @@
+{
+  "name": "RFQ to Quote Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "filters": {
+          "readStatus": "both"
+        }
+      },
+      "id": "c9ec4c80-021d-4ab0-956a-4207d569d1f1",
+      "name": "Gmail Trigger - Watch Inbox",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        96
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "HrSsRy7utrOZMeAO",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "function findPart(parts, mimeType) {\n  for (const part of parts) {\n    if (part.mimeType === mimeType && part.body && part.body.data) {\n      return part.body.data;\n    }\n    if (part.parts) {\n      const found = findPart(part.parts, mimeType);\n      if (found) return found;\n    }\n  }\n  return null;\n}\n\nfunction decodeBase64Url(data) {\n  if (!data) return '';\n  const base64 = data.replace(/-/g, '+').replace(/_/g, '/');\n  try {\n    return Buffer.from(base64, 'base64').toString('utf-8');\n  } catch (e) {\n    return '';\n  }\n}\n\nconst payload = $json.payload || {};\nlet bodyText = '';\n\nif (payload.body && payload.body.data) {\n  bodyText = decodeBase64Url(payload.body.data);\n} else if (payload.parts) {\n  const plainData = findPart(payload.parts, 'text/plain');\n  if (plainData) {\n    bodyText = decodeBase64Url(plainData);\n  } else {\n    const htmlData = findPart(payload.parts, 'text/html');\n    if (htmlData) {\n      bodyText = decodeBase64Url(htmlData).replace(/<[^>]+>/g, ' ');\n    }\n  }\n}\n\nif (!bodyText) {\n  bodyText = $json.snippet || '';\n}\n\nconst binary = $input.item.binary || {};\nconst attachmentKeys = Object.keys(binary).filter(k => k.startsWith('attachment_'));\nconst outBinary = { ...binary };\nif (attachmentKeys.length > 0) {\n  outBinary.data = binary[attachmentKeys[0]];\n}\n\nreturn {\n  json: {\n    from: $json.From || $json.from || '',\n    subject: $json.Subject || $json.subject || '',\n    bodyText: bodyText,\n    hasAttachments: attachmentKeys.length > 0,\n    attachmentCount: attachmentKeys.length\n  },\n  binary: outBinary\n};"
+      },
+      "id": "ff157d62-8a92-48fe-9bc2-5790c6ba82b7",
+      "name": "Normalize Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.hasAttachments }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "rightValue": true,
+              "id": "888c74f7-f723-45b0-9106-64c0a5e6c820"
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "d7d82510-acfc-4790-ac55-5c2f8b3273fc",
+      "name": "Has Attachment?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        448,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "id": "308bbdc6-9e6f-4def-afc8-5a154b3c0f4a",
+      "name": "Extract Text From PDF",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        672,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "documentText-pdf",
+              "name": "documentText",
+              "value": "={{ $json.text }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "637ce58b-170c-4768-aeba-61af36802468",
+      "name": "Use PDF Text",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        896,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const schema = [\n  '{',\n  '  \"is_rfq\": boolean,',\n  '  \"origin\": string or null,',\n  '  \"destination\": string or null,',\n  '  \"commodity\": string or null,',\n  '  \"weight_kg\": number or null,',\n  '  \"volume_cbm\": number or null,',\n  '  \"mode\": \"air\" or \"ocean\" or \"road\" or null,',\n  '  \"incoterm\": string or null,',\n  '  \"requested_pickup_date\": string (ISO date) or null,',\n  '  \"customer_name\": string or null,',\n  '  \"customer_email\": string or null,',\n  '  \"special_requirements\": string or null,',\n  '  \"confidence_notes\": string',\n  '}'\n].join('\\n');\n\nconst prompt = 'You are extracting structured data from a freight Request for Quote (RFQ) email or document.\\n\\n' +\n  'Subject: ' + ($json.subject || '') + '\\n\\n' +\n  'Content:\\n' + ($json.documentText || '') + '\\n\\n' +\n  'Return ONLY valid JSON, no markdown, no commentary, matching exactly this schema:\\n' + schema + '\\n' +\n  'If a field cannot be determined, use null. Do NOT guess or fabricate values. If this is not actually an RFQ (e.g. a confirmation, invoice, or unrelated email), set is_rfq to false and leave other fields null.';\n\nreturn {\n  json: {\n    ...$json,\n    extractionPrompt: prompt\n  }\n};"
+      },
+      "id": "dab58cb9-c192-49bf-801e-6751c3923137",
+      "name": "Build Extraction Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"model\": \"claude-sonnet-4-6\", \"max_tokens\": 1500, \"messages\": [ { \"role\": \"user\", \"content\": $json.extractionPrompt } ] } }}",
+        "options": {}
+      },
+      "id": "172dce5d-909a-4d17-a219-5f3ed98bf595",
+      "name": "Claude - Extract RFQ Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1344,
+        96
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "uAFZTpXPa8K43Q5t",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $json;\n\nlet rawText = '';\ntry {\n  rawText = response.content?.[0]?.text || '';\n} catch (e) {\n  rawText = '';\n}\nrawText = rawText.replace(/```json/g, '').replace(/```/g, '').trim();\n\nlet parsed = null;\nlet validationError = null;\ntry {\n  parsed = JSON.parse(rawText);\n} catch (e) {\n  validationError = 'Failed to parse JSON from model output: ' + e.message;\n}\n\nconst requiredKeys = ['is_rfq', 'origin', 'destination', 'commodity', 'weight_kg', 'mode'];\nif (parsed) {\n  const missingKeys = requiredKeys.filter(k => !(k in parsed));\n  if (missingKeys.length > 0) {\n    validationError = 'Missing expected keys: ' + missingKeys.join(', ');\n  }\n}\n\nconst needsReview = !parsed || !!validationError || parsed.is_rfq === false ||\n  !parsed.origin || !parsed.destination || !parsed.weight_kg;\n\nconst sourceFrom = $('Normalize Email').item.json.from;\nconst sourceSubject = $('Normalize Email').item.json.subject;\n\nreturn {\n  json: {\n    ...(parsed || {}),\n    _validationError: validationError,\n    _needsReview: needsReview,\n    _rawModelOutput: rawText,\n    _sourceEmailFrom: sourceFrom,\n    _sourceSubject: sourceSubject,\n    _receivedAt: new Date().toISOString()\n  }\n};"
+      },
+      "id": "8a3134b4-5656-439f-9939-9cc50b97c6e4",
+      "name": "Validate Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1-r2FUl990ayZVXjk-zOrZKb46yDFlBg-CcmdOwU6cXw",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1-r2FUl990ayZVXjk-zOrZKb46yDFlBg-CcmdOwU6cXw/edit?gid=0#gid=0",
+          "mode": "url"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Received At",
+              "displayName": "Received At",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "From",
+              "displayName": "From",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Subject",
+              "displayName": "Subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Customer Name",
+              "displayName": "Customer Name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Origin",
+              "displayName": "Origin",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Destination",
+              "displayName": "Destination",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Commodity",
+              "displayName": "Commodity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Weight (kg)",
+              "displayName": "Weight (kg)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Volume (cbm)",
+              "displayName": "Volume (cbm)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Mode",
+              "displayName": "Mode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Incoterm",
+              "displayName": "Incoterm",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Requested Pickup",
+              "displayName": "Requested Pickup",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Needs Review",
+              "displayName": "Needs Review",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Notes",
+              "displayName": "Notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "41e020c0-77f8-4303-be27-41599fad626a",
+      "name": "Log to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1792,
+        96
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vU0s9m0tpUvw3wci",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._needsReview }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "rightValue": true
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b77af942-998e-4c21-9f42-a519406a397b",
+      "name": "Needs Human Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2016,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "rfq-alerts",
+          "cachedResultName": "rfq-alerts (replace with your channel)"
+        },
+        "text": "={{ \":warning: RFQ needs manual review\\nFrom: \" + $json._sourceEmailFrom + \"\\nSubject: \" + $json._sourceSubject + \"\\nReason: \" + ($json._validationError || $json.confidence_notes || \"Missing key fields\") + \"\\nCheck the RFQ Log sheet for details.\" }}",
+        "otherOptions": {}
+      },
+      "id": "cf5be499-afbe-483d-b045-c41819cd6eb9",
+      "name": "Alert Slack - Exception",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        2272,
+        -160
+      ],
+      "webhookId": "7f6d69f6-5d0c-422d-8f80-8c28569fe93f"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const data = $json;\n\nconst ratePerKgByMode = {\n  air: 4.20,\n  ocean: 0.85,\n  road: 1.10\n};\n\nconst baseHandlingFee = 75;\nconst mode = (data.mode || 'road').toLowerCase();\nconst rate = ratePerKgByMode[mode] || ratePerKgByMode.road;\nconst weight = Number(data.weight_kg) || 0;\n\nconst freightCost = Math.round(weight * rate * 100) / 100;\nconst totalQuote = Math.round((freightCost + baseHandlingFee) * 100) / 100;\n\nreturn {\n  json: {\n    ...data,\n    quotedFreightCost: freightCost,\n    quotedHandlingFee: baseHandlingFee,\n    quotedTotal: totalQuote,\n    quoteCurrency: 'USD',\n    quoteValidDays: 7\n  }\n};"
+      },
+      "id": "035eef5e-c51a-4d9f-8dd5-46a16a7c9a17",
+      "name": "Apply Pricing Rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "=Quote for your shipment - {{ $json.origin }} to {{ $json.destination }}",
+        "message": "=Hi {{ $json.customer_name || \"there\" }},\\n\\nThank you for your request. Based on the details provided, here is our quote:\\n\\nOrigin: {{ $json.origin }}\\nDestination: {{ $json.destination }}\\nCommodity: {{ $json.commodity }}\\nWeight: {{ $json.weight_kg }} kg\\nMode: {{ $json.mode }}\\n\\nFreight cost: {{ $json.quoteCurrency }} {{ $json.quotedFreightCost }}\\nHandling fee: {{ $json.quoteCurrency }} {{ $json.quotedHandlingFee }}\\nTotal: {{ $json.quoteCurrency }} {{ $json.quotedTotal }}\\n\\nThis quote is valid for {{ $json.quoteValidDays }} days.\\n\\nPlease review and let us know if you would like to proceed.\\n\\nBest regards,\\nQuoting Team\\n\\n[DRAFT - reviewed and sent by a human before delivery]",
+        "options": {
+          "sendTo": "={{ $json._sourceEmailFrom }}"
+        }
+      },
+      "id": "a42daa22-7dc4-438f-b2e1-3eb17fec81a2",
+      "name": "Draft Quote Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2464,
+        192
+      ],
+      "webhookId": "b4536fa1-0985-4d0c-8b2a-e311fa09bcaf",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "HrSsRy7utrOZMeAO",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "documentText-email",
+              "name": "documentText",
+              "value": "={{ $json.bodyText }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "3d019067-4684-482f-b751-976d0d965ba8",
+      "name": "Use Email Text",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        896,
+        192
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger - Watch Inbox": {
+      "main": [
+        [
+          {
+            "node": "Normalize Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Email": {
+      "main": [
+        [
+          {
+            "node": "Has Attachment?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Attachment?": {
+      "main": [
+        [
+          {
+            "node": "Extract Text From PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Use Email Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text From PDF": {
+      "main": [
+        [
+          {
+            "node": "Use PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use PDF Text": {
+      "main": [
+        [
+          {
+            "node": "Build Extraction Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Extraction Prompt": {
+      "main": [
+        [
+          {
+            "node": "Claude - Extract RFQ Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - Extract RFQ Data": {
+      "main": [
+        [
+          {
+            "node": "Validate Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Extraction": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Needs Human Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Human Review?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Apply Pricing Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Pricing Rules": {
+      "main": [
+        [
+          {
+            "node": "Draft Quote Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use Email Text": {
+      "main": [
+        [
+          {
+            "node": "Build Extraction Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "versionId": "60ebaa8d-b604-45af-8766-c5b2b5a183c9",
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp",
+    "instanceId": "2d6ca2ebf5a100cdffc682c82f821b0294200a733a2dccd104323ab420f01af6"
+  },
+  "nodeGroups": [],
+  "id": "d232QoEkaCeo12AW",
+  "tags": []
+}
